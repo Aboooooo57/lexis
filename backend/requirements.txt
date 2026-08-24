@@ -15,3 +15,6 @@ sqlalchemy[asyncio]
 cryptography>=42.0.0
 certifi
 pymupdf>=1.24.0
+# Lexume Plus subscription (see api/routes/billing.py, api/subscription.py)
+stripe>=10.0.0
+slowapi>=0.1.9

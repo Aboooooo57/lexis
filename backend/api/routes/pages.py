@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request
 from typing import Optional, Dict, Any
-from api import database, config
+from api import database, config, subscription
 from api.auth import get_current_user_id
 from api.models import GenerateRequest, PageResponse
 from api.utils import extract_text_from_gemini, generate_with_timestamps, extract_page_images
+from api.rate_limit import limiter
 import asyncio
 import math
 import os
@@ -49,7 +50,9 @@ def _compute_audio_credits(char_count: int) -> float:
 
 
 @router.get("/session/{session_id}/page/{page_number}", response_model=PageResponse)
+@limiter.limit("30/minute")
 async def get_page(
+    request: Request,
     session_id: str,
     page_number: int,
     background_tasks: BackgroundTasks,
@@ -62,15 +65,20 @@ async def get_page(
     Fetches a specific page of a session.  If the page hasn't been processed yet,
     Gemini extracts the text (Stage 1) and ElevenLabs generates audio (Stage 2).
 
-    Credits are checked at each stage using the exact cost:
-      • Stage 1 – flat CREDIT_COST_EXTRACTION credit, checked before Gemini call.
-      • Stage 2 – dynamic audio credit (4 credits / 1 000 chars, min 2), checked
-                  after extraction so we know the real character count.
+    Access for each stage (see api/subscription.py for the actual gating):
+      • Stage 1 (extraction) – BYOK (gemini_key) or an active Lexume Plus
+        subscription; free/unmetered either way, cheap enough not to quota.
+      • Stage 2 (narration) – BYOK (eleven_key), included in an active
+        subscription's monthly page quota, or — once that quota is used up
+        for the period — the pre-existing credit-based top-up (dynamic
+        audio credit, 4 credits / 1 000 chars, min 2).
 
-    Each stage is deducted with the real USD cost of the underlying API call.
-    If the page returns without audio (generate_audio=False or audio already exists),
-    the `audio_credits` field carries the dynamic estimate so the client can surface
-    an accurate cost before the user decides to generate.
+    Every stage still logs the real USD cost of the underlying API call for
+    operator visibility, even when it isn't billed against the user's credit
+    balance. If the page returns without audio (generate_audio=False or
+    audio already exists), the `audio_credits` field carries the dynamic
+    top-up estimate so the client can surface an accurate cost before the
+    user decides to generate.
     """
     lock_key = f"{session_id}:{page_number}"
     if lock_key not in _page_locks:
@@ -100,18 +108,13 @@ async def get_page(
         needs_extraction = not has_text
         needs_audio      = generate_audio and not has_audio
 
-        # ── 2. Stage 1 pre-flight: extraction credit ─────────────────────────
-        extraction_credits = config.CREDIT_COST_EXTRACTION if needs_extraction else 0.0
-        if extraction_credits > 0:
-            balance = await database.get_credits(user_id)
-            if balance < extraction_credits:
-                raise HTTPException(
-                    status_code=402,
-                    detail=(
-                        f"Insufficient credits: {balance:.1f} available, "
-                        f"{extraction_credits:.1f} required for text extraction"
-                    ),
-                )
+        # ── 2. Stage 1 gate: BYOK or an active Lexume Plus subscription ──────
+        # Extraction is cheap (~$0.004/page) so it isn't quota-metered for
+        # subscribers, just gated on access — see api/subscription.py. Raises
+        # 402 if neither a key nor an active subscription is available.
+        resolved_gemini_key = ""
+        if needs_extraction:
+            resolved_gemini_key = await subscription.resolve_extraction_key(gemini_key, user_id)
 
         # ── 3. Fetch session meta ────────────────────────────────────────────
         session = await database.get_session(session_id)
@@ -146,7 +149,7 @@ async def get_page(
                         inline_text=None,
                         page_indices=[page_number - 1],
                         gemini_model=config.DEFAULT_GEMINI_MODEL,
-                        api_key=gemini_key or config.GEMINI_API_KEY,
+                        api_key=resolved_gemini_key,
                         file_uri=gemini_file_uri,
                         _usage_out=gemini_usage,
                     )
@@ -172,7 +175,7 @@ async def get_page(
                         inline_text=None,
                         page_indices=[actual_page_idx],
                         gemini_model=config.DEFAULT_GEMINI_MODEL,
-                        api_key=gemini_key or config.GEMINI_API_KEY,
+                        api_key=resolved_gemini_key,
                         _usage_out=gemini_usage,
                     )
                     page_title     = result.get("title", "Lesson Page").strip()
@@ -198,41 +201,62 @@ async def get_page(
                 except Exception as e:
                     print(f"WARN: Image extraction failed: {e}")
 
-            # Deduct extraction credit
+            # Extraction is free/unmetered on both the BYOK and
+            # included-in-subscription paths (see api/subscription.py) — log
+            # the real USD cost for operator visibility without touching the
+            # credit balance (amount=0).
             gemini_usd = _compute_gemini_usd(gemini_usage)
             await database.deduct_credits(
                 user_id,
-                extraction_credits,
-                reason="page_extraction",
+                0.0,
+                reason="page_extraction" if gemini_key else "page_extraction_subscription",
                 session_id=session_id,
                 usd_cost=round(gemini_usd, 6),
             )
 
-        # ── 5. Stage 2 pre-flight: dynamic audio credit ──────────────────────
-        audio_credits = 0.0
+        # ── 5. Stage 2 gate: BYOK, subscription quota, or a credit top-up ────
         paragraphs = _split_paragraphs(extracted_text) if extracted_text.strip() else []
+        audio_credits = 0.0
+        narration_access: Optional[str] = None
+        resolved_eleven_key = ""
+        eleven_model = config.DEFAULT_ELEVENLABS_MODEL
 
         if needs_audio and extracted_text.strip():
-            audio_credits = _compute_audio_credits(len(extracted_text))
-            balance = await database.get_credits(user_id)
-            if balance < audio_credits:
-                # Text extraction succeeded — save it so the credit is not wasted
-                await database.save_session_page(session_id, page_number, {
-                    "title":      page_title,
-                    "extracted":  extracted_text,
-                    "paragraphs": paragraphs,
-                    "audio_bytes":  b"",
-                    "word_timings": [],
-                    "page_images":  page_images,
-                })
+            narration_access = await subscription.check_narration_access(eleven_key, user_id)
+
+            if narration_access == "unauthorized":
                 raise HTTPException(
                     status_code=402,
-                    detail=(
-                        f"Insufficient credits for audio: {balance:.1f} available, "
-                        f"{audio_credits:.1f} required ({len(extracted_text):,} characters). "
-                        f"The extracted text has been saved — you can generate audio later."
-                    ),
+                    detail="No ElevenLabs key provided and no active Lexume Plus subscription.",
                 )
+
+            if narration_access == "subscription_over_quota":
+                # Quota used up for this billing period — fall back to the
+                # existing credit-based top-up (still uses Lexume's own key).
+                audio_credits = _compute_audio_credits(len(extracted_text))
+                balance = await database.get_credits(user_id)
+                if balance < audio_credits:
+                    # Text extraction succeeded — save it so that work isn't wasted
+                    await database.save_session_page(session_id, page_number, {
+                        "title":      page_title,
+                        "extracted":  extracted_text,
+                        "paragraphs": paragraphs,
+                        "audio_bytes":  b"",
+                        "word_timings": [],
+                        "page_images":  page_images,
+                    })
+                    raise HTTPException(
+                        status_code=402,
+                        detail=(
+                            f"Lexume Plus narration quota reached for this billing period, and your "
+                            f"credit balance ({balance:.1f}) doesn't cover the top-up cost "
+                            f"({audio_credits:.1f} credits for {len(extracted_text):,} characters). "
+                            f"The extracted text has been saved — you can generate audio later, or "
+                            f"add your own ElevenLabs key."
+                        ),
+                    )
+
+            resolved_eleven_key, eleven_model = subscription.narration_credentials(narration_access, eleven_key)
 
         # ── 6. Generate audio (Stage 2) ──────────────────────────────────────
         elevenlabs_chars = 0
@@ -242,23 +266,37 @@ async def get_page(
                 audio_bytes, word_timings = await generate_with_timestamps(
                     text=extracted_text,
                     voice_settings=None,
-                    elevenlabs_model=config.DEFAULT_ELEVENLABS_MODEL,
+                    elevenlabs_model=eleven_model,
                     voice_id=config.ELEVENLABS_VOICE_ID,
-                    api_key=eleven_key or config.ELEVENLABS_API_KEY
+                    api_key=resolved_eleven_key,
                 )
             except Exception as e:
                 print(f"ERROR: Audio generation failed: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Failed to generate audio: {str(e)}")
 
-            # Deduct audio credit (real ElevenLabs USD cost)
+            # Bill the call: a credit-ledger charge only for the
+            # over-quota-topup case; an included-in-subscription call
+            # advances the quota counter instead, and BYOK is always free.
+            # All three still log the real USD cost for operator visibility.
             elevenlabs_usd = _compute_elevenlabs_usd(elevenlabs_chars)
-            await database.deduct_credits(
-                user_id,
-                audio_credits,
-                reason="audio_generation",
-                session_id=session_id,
-                usd_cost=round(elevenlabs_usd, 6),
-            )
+            if narration_access == "subscription_over_quota":
+                await database.deduct_credits(
+                    user_id,
+                    audio_credits,
+                    reason="audio_generation_topup",
+                    session_id=session_id,
+                    usd_cost=round(elevenlabs_usd, 6),
+                )
+            else:
+                if narration_access == "subscription":
+                    await database.increment_narration_usage(user_id)
+                await database.deduct_credits(
+                    user_id,
+                    0.0,
+                    reason=f"audio_generation_{narration_access}",
+                    session_id=session_id,
+                    usd_cost=round(elevenlabs_usd, 6),
+                )
 
         # ── 7. Persist processed page ────────────────────────────────────────
         await database.save_session_page(session_id, page_number, {

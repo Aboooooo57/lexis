@@ -5,9 +5,9 @@ import jwt
 from google.oauth2 import id_token
 from google.auth.transport import requests
 from google_auth_oauthlib.flow import Flow
-from fastapi import HTTPException, Security, Request, Cookie
+from fastapi import HTTPException, Security, Request, Cookie, Depends
 
-from api import config
+from api import config, database
 
 # In-memory store for valid OAuth states and their PKCE code_verifiers
 VALID_STATES = {} # Dict[state, code_verifier]
@@ -168,3 +168,17 @@ async def get_current_user_id(request: Request, access_token: Optional[str] = Co
         return user_id
     except HTTPException as e:
         raise e
+
+
+async def require_active_subscription(user_id: str = Depends(get_current_user_id)) -> str:
+    """
+    Dependency for routes that should only be reachable with a real Lexume
+    Plus subscription (e.g. the billing status/portal endpoints). Most
+    extraction/narration routes do NOT use this directly — they accept an
+    optional BYOK key and only fall into the subscription-gated path when
+    none was supplied, via api/subscription.py's resolve_*_key() helpers,
+    which is where this same active-subscription check happens for them.
+    """
+    if not await database.is_subscription_active(user_id):
+        raise HTTPException(status_code=402, detail="An active Lexume Plus subscription is required.")
+    return user_id

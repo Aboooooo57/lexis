@@ -262,6 +262,21 @@ Return full session data as JSON (used by the Next.js result page).
 
 ---
 
+### Lexume Plus billing (`/api/billing/...`)
+
+See "Lexume Plus subscription" below for the full picture. Quick reference:
+
+| Endpoint | Description |
+|---|---|
+| `POST /api/billing/stripe/checkout` | Create a Stripe Checkout session (`{"plan": "monthly"\|"annual"}`) |
+| `POST /api/billing/stripe/portal` | Stripe Billing Portal link (manage/cancel) |
+| `POST /api/billing/stripe/webhook` | Stripe webhook receiver — not for direct client use |
+| `POST /api/billing/play/verify` | Verify a Google Play purchase token server-side |
+| `POST /api/billing/play/webhook` | Play Real-time Developer Notifications receiver — not for direct client use |
+| `GET /api/billing/status` | Current user's subscription status + quota usage |
+
+---
+
 ## Configuration
 
 Copy `.env.example` to `backend/.env`. All keys are documented there.
@@ -287,6 +302,67 @@ Set in `frontend/.env.local`:
 | Variable | Default | Description |
 |---|---|---|
 | `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Backend API base URL |
+
+---
+
+## Lexume Plus subscription
+
+Every app in this repo defaults to **bring your own API keys** — free, local,
+zero Lexume server dependency — and that stays true. **Lexume Plus** is an
+additive paid option: an active subscriber can use Lexume's own Gemini +
+ElevenLabs keys instead, without ever entering their own. The two modes are
+just a per-request choice (BYOK key present → BYOK; absent → requires an
+active subscription) — see `backend/api/subscription.py` for the actual
+gating logic, and the business/unit-economics rationale behind the numbers
+below in the subscription plan this was built from.
+
+**Compliance note, read before enabling this for real users**: reselling
+ElevenLabs access via a subscription wrapper requires becoming an
+[Authorized Reseller](https://elevenlabs.io/use-policy) (or using their
+Business/Enterprise commercial tier) — contact ElevenLabs before a public
+launch, not after. Also use a genuine **paid-tier** Gemini key for
+`GEMINI_API_KEY` here, not a free AI Studio key — free-tier terms allow
+Google to train on prompts, which isn't acceptable for paying subscribers'
+documents.
+
+### How it works
+
+- **Extraction** (Gemini): free/unmetered for both BYOK and subscribers —
+  cheap enough (~$0.004/page) not to bother quota-limiting.
+- **Narration** (ElevenLabs): free for BYOK. Subscribers get
+  `SUBSCRIPTION_PAGES_QUOTA` (70 by default) narrated pages per billing
+  period, forced to a Flash/Turbo voice model to keep unit economics sane —
+  past that, the pre-existing credit-purchase flow (`/api/users/me/credits/purchase`)
+  acts as a paid top-up rather than a hard cutoff.
+- **Payment platforms**: Google Play Billing (Android — mandatory, it's
+  Play-distributed) and Stripe (web / Mac, which stays direct-DMG
+  distributed, so Apple's IAP mandate doesn't apply). Neither platform's
+  client-reported purchase is ever trusted directly — Stripe changes arrive
+  via signature-verified webhooks, Play purchases are verified server-side
+  against the Play Developer API before a subscription is marked active.
+
+### Setup
+
+Fill in the `SUBSCRIPTION_*` / `STRIPE_*` / `PLAY_*` variables documented in
+`.env.example` — all optional; endpoints return `503` until configured
+rather than failing at startup. You'll need:
+- A Stripe account with a subscription Product carrying a monthly and an
+  annual Price, and a webhook endpoint (`/api/billing/stripe/webhook`)
+  registered for `checkout.session.completed`, `customer.subscription.updated`,
+  `customer.subscription.deleted`.
+- A Google Play Console service account with Android Publisher API access
+  (Play Console → Setup → API access) for `PLAY_SERVICE_ACCOUNT_JSON`, and a
+  Pub/Sub push subscription pointed at `/api/billing/play/webhook?secret=...`
+  for Real-time Developer Notifications.
+
+### Status
+
+| # | Milestone | Status |
+|---|---|---|
+| 1 | Backend billing foundation (this repo's `backend/`) | ✅ built and smoke-tested against a real SQLite DB + FastAPI TestClient in this sandbox (subscription gating, quota exhaustion, unconfigured-platform 503s, unauthenticated 401 all verified) — **the actual Stripe/Play Billing HTTP calls themselves are unverified**, since no live credentials exist here. Verify webhook signature handling and purchase verification against real Stripe test-mode and a Play Console closed-testing track before trusting this in production. |
+| 2 | Android integration | ⬜ not started |
+| 3 | Mac/iPad integration | ⬜ not started |
+| 4 | Compliance & launch prep (ElevenLabs reseller status, paid Gemini key, privacy policy, closed beta) | ⬜ not started |
 
 ---
 

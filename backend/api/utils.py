@@ -487,8 +487,24 @@ async def fetch_word_definition(word: str) -> dict | None:
     return None
 
 
-async def translate_text(text: str, target_language: str, api_key: str | None = None, engine: str = "google") -> str:
-    """Translate word/phrase using the preferred engine (fast Google API or accurate Gemini)."""
+async def translate_text(
+    text: str,
+    target_language: str,
+    api_key: str | None = None,
+    engine: str = "google",
+    resolve_gemini_key=None,
+) -> str:
+    """
+    Translate word/phrase using the preferred engine (fast Google API or
+    accurate Gemini). The free Google endpoint (engine="google") costs
+    nothing and isn't gated; Gemini — used when explicitly requested, or as
+    the fallback when the free endpoint fails — costs real money, so when
+    the caller didn't already resolve a key (`api_key`), `resolve_gemini_key`
+    (an async callable, typically api.subscription.resolve_extraction_key
+    bound to the current user) is called lazily, only if Gemini actually
+    ends up needed. This keeps the common free-path case ungated while still
+    requiring BYOK-or-an-active-subscription for the real Gemini call.
+    """
     if engine == "google":
         # Map friendly language names to ISO 639-1 codes
         lang_map = {
@@ -520,6 +536,8 @@ async def translate_text(text: str, target_language: str, api_key: str | None = 
                 print(f"Fast translation failed: {e}. Falling back to Gemini.")
 
     # 2. Gemini Translation (either requested or fallback)
+    if api_key is None and resolve_gemini_key is not None:
+        api_key = await resolve_gemini_key()
     client = _get_gemini_client(api_key)
     prompt = (
         f"Translate the following English word or phrase to {target_language}. "
