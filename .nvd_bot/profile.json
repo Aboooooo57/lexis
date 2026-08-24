@@ -26,7 +26,9 @@
       "sqlalchemy": "unknown",
       "cryptography": ">=42.0.0",
       "certifi": "unknown",
-      "pymupdf": ">=1.24.0"
+      "pymupdf": ">=1.24.0",
+      "stripe": ">=10.0.0",
+      "slowapi": ">=0.1.9"
     },
     "frontend/package.json": {
       "clsx": "2.1.1",
@@ -47,8 +49,8 @@
       "typescript": "6.0.3"
     }
   },
-  "last_commit_sha": "1ba8c9ec1910ce5d3a6360bafc197d3146372664",
-  "last_scanned_at": "2026-08-11T09:00:58.835207+00:00",
+  "last_commit_sha": "631e3c1396aefde5cdeddcd5bed5ef1d16c2d180",
+  "last_scanned_at": "2026-08-24T09:24:34.698672+00:00",
   "enabled": true,
   "overrides": {}
 }
