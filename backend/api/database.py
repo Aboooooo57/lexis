@@ -111,6 +111,26 @@ class UserPreference(Base):
     credits: Mapped[float] = mapped_column(Float, default=config.CREDIT_STARTER_BALANCE)
 
 
+class Subscription(Base):
+    """
+    Lexume Plus subscription state — one row per user. Populated/kept in sync
+    by the Stripe and Google Play Billing webhook handlers in
+    api/routes/billing.py; read (never trusted from the client) by
+    api/subscription.py to gate the BYOK-or-Lexume's-own-keys fallback.
+    """
+    __tablename__ = "subscriptions"
+    user_id: Mapped[str] = mapped_column(String, primary_key=True)
+    plan: Mapped[str] = mapped_column(String, default="monthly")  # "monthly" | "annual"
+    status: Mapped[str] = mapped_column(String, default="inactive")  # "active" | "canceled" | "past_due" | "inactive"
+    payment_platform: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # "stripe" | "play"
+    platform_customer_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Stripe customer id
+    platform_subscription_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Stripe sub id / Play purchase token
+    current_period_end: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # ISO timestamp
+    period_started_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    pages_narrated_this_period: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+
 class CreditTransaction(Base):
     __tablename__ = "credit_transactions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -626,6 +646,104 @@ async def add_credits(user_id: str, amount: float, reason: str = "admin_grant") 
             )
             db.add(tx)
             return new_balance
+
+
+# --- Subscription functions ---
+
+def _subscription_to_dict(sub: "Subscription") -> Dict[str, Any]:
+    return {
+        "user_id": sub.user_id,
+        "plan": sub.plan,
+        "status": sub.status,
+        "payment_platform": sub.payment_platform,
+        "platform_customer_id": sub.platform_customer_id,
+        "platform_subscription_id": sub.platform_subscription_id,
+        "current_period_end": sub.current_period_end,
+        "period_started_at": sub.period_started_at,
+        "pages_narrated_this_period": sub.pages_narrated_this_period,
+        "updated_at": sub.updated_at,
+    }
+
+
+async def get_subscription(user_id: str) -> Optional[Dict[str, Any]]:
+    async with AsyncSessionLocal() as session:
+        sub = await session.get(Subscription, user_id)
+        return _subscription_to_dict(sub) if sub else None
+
+
+async def get_subscription_by_platform_id(platform_subscription_id: str) -> Optional[Dict[str, Any]]:
+    """Look up a subscription by its Stripe subscription id / Play purchase token — used by webhook handlers, which only carry the platform's own id."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(Subscription).where(Subscription.platform_subscription_id == platform_subscription_id)
+        result = await session.execute(stmt)
+        sub = result.scalar_one_or_none()
+        return _subscription_to_dict(sub) if sub else None
+
+
+async def upsert_subscription(user_id: str, **fields: Any) -> Dict[str, Any]:
+    """
+    Create or update a user's subscription row. Only touches the columns
+    passed in `fields`; always stamps `updated_at`. Used by both the Stripe
+    and Play webhook/verify handlers so neither has to know whether a row
+    already exists.
+    """
+    now = datetime.datetime.now().isoformat()
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            sub = await session.get(Subscription, user_id)
+            if not sub:
+                sub = Subscription(user_id=user_id)
+                session.add(sub)
+            for key, value in fields.items():
+                setattr(sub, key, value)
+            sub.updated_at = now
+            await session.flush()
+            return _subscription_to_dict(sub)
+
+
+async def is_subscription_active(user_id: str) -> bool:
+    """
+    True iff status is "active" and, when a period end is recorded, it
+    hasn't passed. The period-end check is a safety net for a missed
+    cancellation webhook — status is the primary source of truth and is
+    kept current by the Stripe/Play webhook handlers.
+    """
+    sub = await get_subscription(user_id)
+    if not sub or sub["status"] != "active":
+        return False
+    period_end = sub.get("current_period_end")
+    if period_end and period_end < datetime.datetime.now().isoformat():
+        return False
+    return True
+
+
+async def increment_narration_usage(user_id: str) -> int:
+    """Advance the current period's narrated-page counter by 1. Returns the new count."""
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            sub = await session.get(Subscription, user_id)
+            if not sub:
+                # Shouldn't happen — narration only reaches this after
+                # is_subscription_active() passed, which requires a row —
+                # but don't crash the narration response over bookkeeping.
+                return 0
+            sub.pages_narrated_this_period = (sub.pages_narrated_this_period or 0) + 1
+            return sub.pages_narrated_this_period
+
+
+async def start_new_billing_period(user_id: str, current_period_end: str) -> None:
+    """Reset the narration counter for a new billing period (called from the Stripe/Play webhook handlers on renewal)."""
+    now = datetime.datetime.now().isoformat()
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            sub = await session.get(Subscription, user_id)
+            if not sub:
+                sub = Subscription(user_id=user_id)
+                session.add(sub)
+            sub.current_period_end = current_period_end
+            sub.period_started_at = now
+            sub.pages_narrated_this_period = 0
+            sub.updated_at = now
 
 
 async def get_credit_history(user_id: str, limit: int = 20) -> List[Dict[str, Any]]:

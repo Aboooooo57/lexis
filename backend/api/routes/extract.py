@@ -7,11 +7,12 @@ import asyncio
 import json
 import httpx
 
-from fastapi import APIRouter, Form, HTTPException, UploadFile, Depends
+from fastapi import APIRouter, Form, HTTPException, UploadFile, Depends, Request
 from google import genai
 from api.utils import _get_gemini_client
-from api import config
+from api import config, subscription
 from api.auth import get_current_user_id
+from api.rate_limit import limiter
 
 from api import session as sess
 from api.models import ExtractResponse
@@ -24,7 +25,9 @@ from api.utils import (
 router = APIRouter()
 
 @router.post("/extract", response_model=ExtractResponse)
+@limiter.limit("20/minute")
 async def extract(
+    request: Request,
     file: UploadFile | None = None,
     text: str = Form(default=""),
     pages: str = Form(default=""),
@@ -87,10 +90,13 @@ async def extract(
                 page_indices = list(range(total))
                 total_pages = total
             
-            # Upload the subset PDF to Gemini File API
+            # Upload the subset PDF to Gemini File API — BYOK or an active
+            # Lexume Plus subscription, same gate as per-page extraction
+            # (api/routes/pages.py); raises 402 if neither is available.
+            resolved_gemini_key = await subscription.resolve_extraction_key(gemini_key, user_id)
             subset_pdf_path = await extract_pdf_pages(tmp_path, page_indices)
             try:
-                client = _get_gemini_client(gemini_key)
+                client = _get_gemini_client(resolved_gemini_key)
                 uploaded_file = await client.aio.files.upload(file=subset_pdf_path)
                 gemini_file_uri = uploaded_file.uri
             finally:

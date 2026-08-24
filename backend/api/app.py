@@ -12,9 +12,12 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
+from api.rate_limit import limiter
 from api.routes.extract import router as extract_router
 from api.routes.generate import router as generate_router
 from api.routes.dictionary import router as dict_router
@@ -24,6 +27,7 @@ from api.routes.audio import router as audio_router
 from api.routes.session import router as session_router
 from api.routes.auth import router as auth_router
 from api.routes.pages import router as pages_router
+from api.routes.billing import router as billing_router
 
 from contextlib import asynccontextmanager
 from api.database import init_db
@@ -35,6 +39,17 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Lexume – English Reader & Translator", lifespan=lifespan)
+
+# Rate limiting — none existed before the Lexume Plus subscription work;
+# added specifically because a company-held key now sits behind these
+# routes (BYOK requests hit the same limiter but only cost the caller their
+# own API usage, so this is generous enough not to bother them). Per-IP
+# since these routes also carry an auth dependency, not a substitute for it.
+# The Limiter instance itself lives in api/rate_limit.py (see that module's
+# docstring for why — avoids a circular import with the route modules that
+# apply @limiter.limit(...)).
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS — set ALLOWED_ORIGINS in .env for production (comma-separated list)
 _raw_origins = os.environ.get(
@@ -61,4 +76,5 @@ app.include_router(audio_router, prefix="/api")
 app.include_router(session_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(pages_router, prefix="/api")
+app.include_router(billing_router, prefix="/api")
 

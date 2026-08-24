@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os
-from api import config
+from api import config, subscription
 from fastapi import APIRouter, HTTPException, Depends
 from api.auth import get_current_user_id
 from api import session as sess
@@ -21,7 +21,17 @@ async def translate(req: TranslateRequest, user_id: str = Depends(get_current_us
     target_lang = prefs.get("target_language", "Persian")
     engine = prefs.get("translation_engine", "google")
     print(f"Translating using engine: {engine}")
-    translation = await translate_text(req.text, target_lang, engine=engine)
+
+    # This route has no user-supplied Gemini key field today (BYOK isn't
+    # expressible here yet — a future enhancement, not a subscription-gap),
+    # so the only way the real Gemini fallback can proceed is an active
+    # Lexume Plus subscription. The free Google endpoint (the common case)
+    # is untouched by this — resolve_gemini_key is only invoked if Gemini
+    # actually ends up needed, see api/utils.py's translate_text.
+    async def _resolve_gemini_key() -> str:
+        return await subscription.resolve_extraction_key(None, user_id)
+
+    translation = await translate_text(req.text, target_lang, engine=engine, resolve_gemini_key=_resolve_gemini_key)
     return {"translation": translation}
 
 @router.get("/dictionary/{word}")
@@ -51,9 +61,7 @@ async def key_terms(
     if mock_gemini:
         return KeyTermsResponse(terms=["asyncio", "concurrent", "multiprocessing", "lightweight", "yield"])
 
-    resolved_key = gemini_key.strip() or config.GEMINI_API_KEY
-    if not resolved_key:
-        raise HTTPException(400, "Gemini API key is required.")
+    resolved_key = await subscription.resolve_extraction_key(gemini_key.strip() or None, user_id)
 
     try:
         terms = await identify_key_terms(
